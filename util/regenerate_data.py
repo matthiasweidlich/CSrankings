@@ -1,7 +1,7 @@
 import argparse
+import contextlib
 import gzip
 import xmltodict
-import collections
 import json
 import csv
 import sys
@@ -17,10 +17,12 @@ from csrankings import (
     confdict,
     TOG_SIGGRAPH_Volume,
     TOG_SIGGRAPH_Asia_Volume,
+    CGF_EUROGRAPHICS_Volume,
     TVCG_Vis_Volume,
     TVCG_VR_Volume,
+    map_pacmmod_to_conference,
 )
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 
 parser = argparse.ArgumentParser(
     prog="csrankings",
@@ -131,15 +133,8 @@ def build_dicts() -> None:
             reversealiasdict[row["name"]] = row["alias"]
 
     # Count and report the total number of faculty in the database.
-    totalFaculty = 0
-    for name in facultydict:
-        # Exclude aliases.
-        if name in aliasdict:
-            continue
-        totalFaculty += 1
-    print(
-        "Total faculty members currently in the database: " + str(totalFaculty)
-    )
+    totalFaculty = sum(name not in aliasdict for name in facultydict)
+    print(f"Total faculty members currently in the database: {str(totalFaculty)}")
 
 
 def handle_article(_: Any, article: ArticleType) -> bool:  # type: ignore
@@ -150,43 +145,40 @@ def handle_article(_: Any, article: ArticleType) -> bool:  # type: ignore
     counter += 1
     try:
         if counter % 10000 == 0:
-            print(str(counter) + " papers processed.")
+            print(f"{counter} papers processed.")
         if "author" not in article:
             return True
         # Fix if there is just one author.
         authorList: List[str] = []
         if type(article["author"]) == list:
-            authorList = article["author"]
-        else:
-            if type(article["author"]) == str:
-                authorList = [str(article["author"])]
-            elif type(article["author"]) is collections.OrderedDict:
-                authorList = [article["author"]["#text"]]  # type: ignore
-            else:
-                print("***Unknown record type, skipping.***")
-                return True
-        authorsOnPaper = len(authorList)
-        foundOneInDict = False or args.all
-        if not args.all:
-            for authorName in authorList:
-                if type(authorName) is collections.OrderedDict:
+            for authorName in article["author"]:
+                if type(authorName) is OrderedDict or type(authorName) is dict:
                     aName = authorName["#text"]  # type: ignore
                 else:
                     aName = authorName
                 aName = aName.strip()
-                if aName in facultydict or args.all:
+                authorList.append(aName)
+        elif type(article["author"]) == str:
+            authorList = [str(article["author"])]
+        elif type(article["author"]) is OrderedDict or type(article["author"]) is dict:
+            authorList = [article["author"]["#text"]]  # type: ignore
+        else:
+            print("***Unknown record type, skipping.***")
+            return True
+        authorsOnPaper = len(authorList)
+        foundOneInDict = False or args.all
+        if not args.all:
+            for authorName in authorList:
+                if authorName in facultydict or args.all:
                     foundOneInDict = True
                     break
-                try:
-                    if aliasdict[aName] in facultydict:
+                with contextlib.suppress(KeyError):
+                    if aliasdict[authorName] in facultydict:
                         foundOneInDict = True
                         break
-                    if reversealiasdict[aName] in facultydict:
+                    if reversealiasdict[authorName] in facultydict:
                         foundOneInDict = True
                         break
-                except KeyError:
-                    pass
-
             if not foundOneInDict:
                 return True
         if "booktitle" in article:
@@ -199,23 +191,27 @@ def handle_article(_: Any, article: ArticleType) -> bool:  # type: ignore
         if args.conference not in confname:
             return True
 
-        if confname not in confdict:
-            return True
-
         volume = article.get("volume", "0")
         number = article.get("number", "0")
         url = article.get("url", "")
         year = int(article.get("year", "-1"))
         pages = ""
 
+        if confname not in confdict:
+            return True
+
         areaname = confdict[confname]
-        # Special handling for PACMPL
-        if areaname == Area("pacmpl"):
+
+        # Special handling for PACMPL and PACMSE
+        if areaname == Area("pacmpl") or areaname == Area("pacmse"):
             confname = Conference(article["number"])
             if confname in confdict:
                 areaname = confdict[confname]
             else:
                 return True
+        elif areaname == Area("pacmmod"):
+            (confname, year) = map_pacmmod_to_conference(confname, year, number)
+            areaname = confdict[confname]
         elif confname == Conference("ACM Trans. Graph."):
             if year in TOG_SIGGRAPH_Volume:
                 (vol, num) = TOG_SIGGRAPH_Volume[year]
@@ -226,6 +222,12 @@ def handle_article(_: Any, article: ArticleType) -> bool:  # type: ignore
                 (vol, num) = TOG_SIGGRAPH_Asia_Volume[year]
                 if (volume == str(vol)) and (number == str(num)):
                     confname = Conference("SIGGRAPH Asia")
+                    areaname = confdict[confname]
+        elif confname == Conference("Comput. Graph. Forum"):
+            if year in CGF_EUROGRAPHICS_Volume:
+                (vol, num) = CGF_EUROGRAPHICS_Volume[year]
+                if (volume == str(vol)) and (number == str(num)):
+                    confname = Conference("EUROGRAPHICS")
                     areaname = confdict[confname]
         elif confname == "IEEE Trans. Vis. Comput. Graph.":
             if year in TVCG_Vis_Volume:
@@ -240,7 +242,7 @@ def handle_article(_: Any, article: ArticleType) -> bool:  # type: ignore
 
         if "title" in article:
             title = Title("")
-            if type(article["title"]) is collections.OrderedDict:
+            if type(article["title"]) is OrderedDict or type(article["title"]) is dict:
                 title = Title(article["title"]["#text"])  # type: ignore
             else:
                 title = Title(article["title"])
@@ -266,7 +268,7 @@ def handle_article(_: Any, article: ArticleType) -> bool:  # type: ignore
         totalPapers += 1
         for authorName in authorList:
             aName = ""
-            if type(authorName) is collections.OrderedDict:
+            if type(authorName) is OrderedDict or type(authorName) is dict:
                 aName = authorName["#text"]  # type: ignore
             elif type(authorName) is str:
                 aName = authorName
@@ -306,9 +308,7 @@ def handle_article(_: Any, article: ArticleType) -> bool:  # type: ignore
                 authlogs[realName] = tmplist
                 interestingauthors[realName] += 1
                 authorscores[(realName, areaname, year)] += 1.0
-                authorscoresAdjusted[(realName, areaname, year)] += (
-                    1.0 / authorsOnPaper
-                )
+                authorscoresAdjusted[(realName, areaname, year)] += 1.0 / authorsOnPaper
     return True
 
 
@@ -320,7 +320,7 @@ def dump_it() -> None:
     global facultydict
     with open("generated-author-info.csv", "w") as f:
         f.write('"name","dept","area","count","adjustedcount","year"\n')
-        authorscores = collections.OrderedDict(sorted(authorscores.items()))
+        authorscores = OrderedDict(sorted(authorscores.items()))
         for ((authorName, area, year), count) in authorscores.items():
             countAdjusted = authorscoresAdjusted[(authorName, area, year)]
             f.write(
@@ -329,7 +329,7 @@ def dump_it() -> None:
 
     with open("articles.json", "w") as f:
         z = []
-        authlogs = collections.OrderedDict(sorted(authlogs.items()))
+        authlogs = OrderedDict(sorted(authlogs.items()))
         for v, l in authlogs.items():
             if v in interestingauthors:
                 for s in sorted(l, key=lambda x: x["name"].decode("utf-8") + str(x["year"]) + x["conf"] + x["title"].decode("utf-8")):  # type: ignore
@@ -343,7 +343,7 @@ def main() -> None:
     build_dicts()
     do_it()
     dump_it()
-    print("Total papers counted = " + str(totalPapers))
+    print(f"Total papers counted = {str(totalPapers)}")
 
 
 if __name__ == "__main__":
